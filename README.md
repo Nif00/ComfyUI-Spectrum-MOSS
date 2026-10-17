@@ -1,6 +1,6 @@
 # ComfyUI-Spectrum-MOSS
 
-Spectrum feature forecasting for the MOSS-Image DiT. On forecast steps the 42 blocks are skipped and the
+Spectrum feature forecasting for the MOSS-Image DiT. On forecast steps the whole transformer is skipped and the
 Chebyshev-fitted pre-head feature goes straight into the final norm and head.
 
 ## Install
@@ -10,7 +10,7 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/Nif00/ComfyUI-Spectrum-MOSS.git
 ```
 
-Requires the [moss-image](https://github.com/OpenMOSS/MOSS-Image) ComfyUI loaders.
+Requires a ComfyUI version with native MOSS-Image support.
 
 ## Usage
 

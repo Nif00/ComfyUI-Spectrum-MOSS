@@ -2,6 +2,8 @@ import logging
 
 import torch
 from comfy import patcher_extension
+from comfy.ldm.flux.layers import timestep_embedding
+from comfy.ldm.moss_image.model import modulated_rms_norm
 
 LOG = logging.getLogger(__name__)
 
@@ -119,37 +121,38 @@ class Spectrum:
         if self.step > self.warmup:
             self.curr_window += self.flex_window
 
-    def model_start(self, uuids, x):
+    def forward(self, executor, x, timestep, context, transformer_options, **kwargs):
+        uuids = transformer_options["uuids"]
         per_chunk = x.shape[0] // len(uuids)
-        self.keys = [(uuid, i) for uuid in uuids for i in range(per_chunk)]
-        self.tokens = x.shape[2] * x.shape[3]
-        self.row = 0
+        keys = [(uuid, i) for uuid in uuids for i in range(per_chunk)]
+        forecasters = [self.forecasters.get(key) for key in keys]
+        if self.forecasting and all(f is not None and f.ready() for f in forecasters):
+            feature = torch.cat([f.predict(self.coord, self.blend) for f in forecasters])
+            return head(executor.class_obj, feature, timestep, x.shape)
+        out = executor(x, timestep, context, transformer_options, **kwargs)
+        feature = self.pending[:, : x.shape[2] * x.shape[3]]
+        for i, key in enumerate(keys):
+            self.forecasters.setdefault(key, Forecaster(self.degree, self.ridge)).update(self.coord, feature[i : i + 1])
+        self.pending = None
+        return out
 
-    def block(self, index, last_index):
-        def run(args, extra):
-            if not self.active:
-                return extra["original_block"](args)
-            if index == 0:
-                self.key = self.keys[self.row]
-                self.row += 1
-                forecaster = self.forecasters.get(self.key)
-                self.cached = self.forecasting and forecaster is not None and forecaster.ready()
-                if self.cached:
-                    return {"img": forecaster.predict(self.coord, self.blend)}
-            elif self.cached:
-                return {"img": args["img"]}
-            out = extra["original_block"](args)
-            if index == last_index:
-                forecaster = self.forecasters.setdefault(self.key, Forecaster(self.degree, self.ridge))
-                forecaster.update(self.coord, out["img"][:, : self.tokens])
-            return out
+    def capture(self, args, extra):
+        out = extra["original_block"](args)
+        self.pending = out["img"]
+        return out
 
-        return run
+
+def head(diffusion_model, feature, timestep, shape):
+    batch, _, height, width = shape
+    vec = diffusion_model.time_embedding(timestep_embedding(timestep, 256).to(feature.dtype))
+    shift, scale = diffusion_model.video_head_modulation(vec).unflatten(-1, (2, -1)).unsqueeze(2).unbind(1)
+    out = diffusion_model.final_linear_video(modulated_rms_norm(feature, diffusion_model.final_norm_video, scale, shift))
+    return out.transpose(1, 2).reshape(batch, diffusion_model.latent_channels, height, width)
 
 
 def patch(model, **settings):
     diffusion_model = model.model.diffusion_model
-    if type(diffusion_model).__name__ != "MOSSImageTransformer":
+    if type(diffusion_model).__name__ != "MOSSImage":
         raise ValueError("Spectrum MOSS requires a MOSS-Image model.")
     model = model.clone()
     spectrum = Spectrum(**settings)
@@ -171,19 +174,18 @@ def patch(model, **settings):
         finally:
             spectrum.step_end()
 
-    def apply_model(executor, x, t, c_concat, c_crossattn, control, transformer_options, **kwargs):
-        if spectrum.active:
-            spectrum.model_start(transformer_options["uuids"], x)
-        return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+    def diffusion_model_wrapper(executor, x, timestep, context, transformer_options, **kwargs):
+        if not spectrum.active:
+            return executor(x, timestep, context, transformer_options, **kwargs)
+        return spectrum.forward(executor, x, timestep, context, transformer_options, **kwargs)
 
     for wrapper_type, wrapper in (
         (patcher_extension.WrappersMP.SAMPLER_SAMPLE, sampler_sample),
         (patcher_extension.WrappersMP.PREDICT_NOISE, predict_noise),
-        (patcher_extension.WrappersMP.APPLY_MODEL, apply_model),
+        (patcher_extension.WrappersMP.DIFFUSION_MODEL, diffusion_model_wrapper),
     ):
         patcher_extension.add_wrapper_with_key(wrapper_type, "spectrum", wrapper, model.model_options, is_model_options=True)
 
-    last_index = len(diffusion_model.layers) - 1
-    for index in range(last_index + 1):
-        model.set_model_patch_replace(spectrum.block(index, last_index), "dit", "single_block", index)
+    # The last block hands over the pre-head feature without allocating inside the block region.
+    model.set_model_patch_replace(spectrum.capture, "dit", "single_block", len(diffusion_model.layers) - 1)
     return model
